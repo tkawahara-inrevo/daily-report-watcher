@@ -42,8 +42,10 @@ if (!ADMIN_USERGROUP_ID) {
  * Bolt (Eventsは受けない / Web APIクライアントとして利用)
  */
 const app = new App({
-  token: BOT_TOKEN
+  token: BOT_TOKEN,
+  receiver: null
 });
+
 
 const client = app.client;
 
