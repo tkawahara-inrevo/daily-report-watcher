@@ -179,27 +179,29 @@ async function postAdminSummaryThreaded({
   channelId,
   label,
   reportDate,
-  targetsCount,
+  targetsCount,     // ← 使わないなら呼び出し側から渡さなくてもOK
   missingUserIds,
   idToNameMap,
 }) {
-  const adminMention = adminMentionText();
+  const adminMention = adminMentionText(); // <!subteam^S...> になる（= @人事）
   const missingCount = missingUserIds.length;
 
+  // ★ここがリクエスト文面
   const parentText = `${adminMention}
-本日の${label}日報未提出者をお知らせします。
+お疲れ様です。
+本日の${label}日報の未提出者をお知らせいたします。
+欠勤/休暇者が含まれる可能性がございますので
+ご確認の上各マネージャーへ連携お願い致します。
 
 日付：${reportDate}
-対象：${targetsCount}
-未提出：${missingCount}
-
-※欠勤/休暇者が含まれる可能性があります。勤務者のみに絞って手動フォローしてください。`;
+未提出：${missingCount}`;
 
   const parentRes = await client.chat.postMessage({
     channel: channelId,
     text: parentText,
   });
 
+  // スレッド：未提出者一覧（メンションしない “名前だけ”）
   if (missingCount === 0) {
     await client.chat.postMessage({
       channel: channelId,
@@ -209,7 +211,6 @@ async function postAdminSummaryThreaded({
     return;
   }
 
-  // スレッドに「名前だけ」を分割投稿
   const chunkSize = 40;
   for (let i = 0; i < missingUserIds.length; i += chunkSize) {
     const chunk = missingUserIds.slice(i, i + chunkSize);
@@ -371,26 +372,38 @@ function scheduleJobs() {
 
   scheduleJobs();
 
-  // 起動テスト：TEST_NOTIFY_CHANNEL がある場合のみ実行（事故防止）
-  if (RUN_ON_BOOT) {
-    if (!TEST_NOTIFY_CHANNEL) {
-      console.warn(
-        "RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels."
-      );
-      return;
-    }
+if (RUN_ON_BOOT) {
+  if (!TEST_NOTIFY_CHANNEL) {
+    console.warn(
+      "RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels."
+    );
+    return;
+  }
 
-    try {
-      // 起動テストは「退勤（前日）」をテストチャンネルへ
+  try {
+    // 退勤：前日分（00:00〜23:59:59）をテストチャンネルへ
+    await runCheck({
+      label: "退勤(起動テスト)",
+      reportChannelId: REPORT_CHANNEL_OUT,
+      cutoffTime: CUTOFF_TIME_OUT,
+      dayOffset: -1,
+      notifyChannelId: TEST_NOTIFY_CHANNEL,
+    });
+
+    // 出勤：当日分（00:00〜(cutoff-1秒)）をテストチャンネルへ
+    if (REPORT_CHANNEL_IN) {
       await runCheck({
-        label: "退勤(起動テスト)",
-        reportChannelId: REPORT_CHANNEL_OUT,
-        cutoffTime: CUTOFF_TIME_OUT,
-        dayOffset: -1,
+        label: "出勤(起動テスト)",
+        reportChannelId: REPORT_CHANNEL_IN,
+        cutoffTime: CUTOFF_TIME_IN,
+        dayOffset: 0,
         notifyChannelId: TEST_NOTIFY_CHANNEL,
       });
-    } catch (e) {
-      console.error("[起動テスト] error", e);
+    } else {
+      console.warn("REPORT_CHANNEL_IN is not set. Skip IN boot test.");
     }
+  } catch (e) {
+    console.error("[起動テスト] error", e);
   }
+}
 })();
