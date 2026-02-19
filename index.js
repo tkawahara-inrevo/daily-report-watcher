@@ -1,4 +1,4 @@
-import { App } from "@slack/bolt";
+import { WebClient } from "@slack/web-api";
 import cron from "node-cron";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
@@ -38,16 +38,7 @@ if (!ADMIN_USERGROUP_ID) {
   console.warn("WARN: ADMIN_USERGROUP_ID is not set. Admin mention will be omitted.");
 }
 
-/**
- * Bolt (Eventsは受けない / Web APIクライアントとして利用)
- */
-const app = new App({
-  token: BOT_TOKEN,
-  receiver: null
-});
-
-
-const client = app.client;
+const client = new WebClient(BOT_TOKEN);
 
 /**
  * Slack API helpers
