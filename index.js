@@ -16,18 +16,26 @@ const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const USERGROUP_ID = process.env.USERGROUP_ID; // 提出対象者（社員など）
 const ADMIN_USERGROUP_ID = process.env.ADMIN_USERGROUP_ID || ""; // 日報管理者ユーザーグループID: S...
 
+// 除外ユーザー（例：システム管理者など）をユーザーIDで指定（カンマ区切り）
+const EXCLUDE_USER_IDS = (process.env.EXCLUDE_USER_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const EXCLUDE_SET = new Set(EXCLUDE_USER_IDS);
+
 // 退勤
-const REPORT_CHANNEL_OUT = process.env.REPORT_CHANNEL_OUT;
-const CUTOFF_TIME_OUT = process.env.CUTOFF_TIME_OUT || "23:59"; // ★A案：当日中判定なら 23:59 推奨
+const REPORT_CHANNEL_OUT = process.env.REPORT_CHANNEL_OUT; // #all-退勤日報 の channel id
+const CUTOFF_TIME_OUT = process.env.CUTOFF_TIME_OUT || "23:59"; // 判定レンジの締め（A案：23:59）
+const RUN_TIME_OUT = process.env.RUN_TIME_OUT || "08:00"; // ★通知を出す時刻（翌朝）
 
 // 出勤（任意）
-const REPORT_CHANNEL_IN = process.env.REPORT_CHANNEL_IN || "";
-const CUTOFF_TIME_IN = process.env.CUTOFF_TIME_IN || "12:00";
+const REPORT_CHANNEL_IN = process.env.REPORT_CHANNEL_IN || ""; // #all-出勤日報 の channel id
+const CUTOFF_TIME_IN = process.env.CUTOFF_TIME_IN || "12:00"; // 判定レンジの締め（例：12:00）
+const RUN_TIME_IN = process.env.RUN_TIME_IN || CUTOFF_TIME_IN; // 通知を出す時刻（基本は締め時刻に合わせる）
 
-// 起動テスト（trueなら起動直後に1回チェック）
-// ★ただし TEST_NOTIFY_CHANNEL が無いと発火しない（事故防止）
+// 起動テスト
 const RUN_ON_BOOT = (process.env.RUN_ON_BOOT || "").toLowerCase() === "true";
-const TEST_NOTIFY_CHANNEL = process.env.TEST_NOTIFY_CHANNEL || "";
+const TEST_NOTIFY_CHANNEL = process.env.TEST_NOTIFY_CHANNEL || ""; // 起動テスト時だけここに通知
 
 if (!BOT_TOKEN) throw new Error("Missing env: SLACK_BOT_TOKEN");
 if (!USERGROUP_ID) throw new Error("Missing env: USERGROUP_ID");
@@ -70,7 +78,7 @@ async function fetchAllMessagesInRange(channelId, oldestUnix, latestUnix) {
 }
 
 /**
- * Extract submitter:
+ * 提出者の抽出：
  * ワークフロー投稿に「報告者（メンション）」が含まれている前提で、
  * 最初の <@U...> を提出者として採用。
  */
@@ -91,16 +99,20 @@ function adminMentionText() {
 }
 
 /**
- * 判定レンジ：
- * start = 今日 00:00:00
- * end   = 今日 cutoff(HH:mm) の「直前1秒」まで（例：12:00 -> 11:59:59）
+ * 判定レンジ（dayOffset を指定）：
+ * baseDay = 今日 + dayOffset（JST） の 00:00:00 〜 cutoff まで
+ *
+ * cutoff(HH:mm) は「直前1秒」まで含める：
+ *  - 12:00 -> 11:59:59
  * ただし cutoff="23:59" は当日中扱いにしたいので 23:59:59 にする
  */
-function getTodayRangeUnix(cutoffTimeHHmm) {
+function getDayRangeUnix({ cutoffTimeHHmm, dayOffset }) {
   const now = dayjs().tz(TZ);
-  const start = now.startOf("day");
 
-  let cutoff = dayjs.tz(`${now.format("YYYY-MM-DD")} ${cutoffTimeHHmm}`, TZ);
+  const baseDay = now.add(dayOffset, "day");
+  const start = baseDay.startOf("day");
+
+  let cutoff = dayjs.tz(`${baseDay.format("YYYY-MM-DD")} ${cutoffTimeHHmm}`, TZ);
 
   if (cutoffTimeHHmm === "23:59") {
     cutoff = cutoff.add(59, "second"); // 23:59:59
@@ -114,6 +126,7 @@ function getTodayRangeUnix(cutoffTimeHHmm) {
 
   return {
     now,
+    reportDate: baseDay.format("YYYY-MM-DD"),
     startUnix: start.unix(),
     endUnix: cutoff.unix(),
   };
@@ -123,7 +136,7 @@ function getTodayRangeUnix(cutoffTimeHHmm) {
  * メンションしないため、ユーザーID -> 表示名へ変換
  * ★ users:read が必要
  *
- * 1人ずつ users.info を叩くと重いので、users.list で一括取得して map を作る。
+ * users.list で一括取得して map を作る（API回数節約）
  */
 async function buildUserIdToNameMap() {
   const map = new Map();
@@ -159,13 +172,13 @@ function mapUserIdsToNames(userIds, idToNameMap) {
 
 /**
  * 通知（チャンネルに投稿）
- * - 親：管理者メンション + 対象/未提出
+ * - 親：管理者メンション + 対象/未提出（検出は出さない）
  * - スレッド：未提出者の「名前だけ」一覧（メンション無し）
  */
 async function postAdminSummaryThreaded({
   channelId,
   label,
-  now,
+  reportDate,
   targetsCount,
   missingUserIds,
   idToNameMap,
@@ -176,7 +189,7 @@ async function postAdminSummaryThreaded({
   const parentText = `${adminMention}
 本日の${label}日報未提出者をお知らせします。
 
-日付：${now.format("YYYY-MM-DD")}
+日付：${reportDate}
 対象：${targetsCount}
 未提出：${missingCount}
 
@@ -218,27 +231,44 @@ async function postAdminSummaryThreaded({
 /**
  * Core check
  *
+ * dayOffset:
+ *  - 出勤：0（当日）
+ *  - 退勤：-1（前日）
+ *
  * notifyChannelId:
  *  - 未指定なら reportChannelId（＝出勤は出勤チャンネル、退勤は退勤チャンネル）
  *  - 起動テスト時だけ TEST_NOTIFY_CHANNEL に差し替える用途
  */
-async function runCheck({ label, reportChannelId, cutoffTime, notifyChannelId }) {
-  const { now, startUnix, endUnix } = getTodayRangeUnix(cutoffTime);
+async function runCheck({
+  label,
+  reportChannelId,
+  cutoffTime,
+  dayOffset,
+  notifyChannelId,
+}) {
+  const { now, reportDate, startUnix, endUnix } = getDayRangeUnix({
+    cutoffTimeHHmm: cutoffTime,
+    dayOffset,
+  });
 
   console.log(`[${label}] start check`, {
     reportChannelId,
     cutoffTime,
+    dayOffset,
     startUnix,
     endUnix,
     now: now.format(),
+    reportDate,
     notifyChannelId: notifyChannelId || reportChannelId,
+    excludeCount: EXCLUDE_USER_IDS.length,
   });
 
-  // 1) 対象者
-  const targetUserIds = await getUserIdsFromUsergroup(USERGROUP_ID);
+  // 1) 対象者（ユーザーグループ）取得 → 除外を引く
+  const rawTargetUserIds = await getUserIdsFromUsergroup(USERGROUP_ID);
+  const targetUserIds = rawTargetUserIds.filter((u) => !EXCLUDE_SET.has(u));
   const targetsSet = new Set(targetUserIds);
 
-  // 2) チャンネル履歴（当日レンジ）
+  // 2) チャンネル履歴（レンジ内）
   const messages = await fetchAllMessagesInRange(reportChannelId, startUnix, endUnix);
 
   // 3) 提出者抽出
@@ -248,7 +278,7 @@ async function runCheck({ label, reportChannelId, cutoffTime, notifyChannelId })
     if (uid) submitters.push(uid);
   }
 
-  // 対象者に含まれる提出のみ採用（関係者以外のメンション混入対策）
+  // 対象者に含まれる提出のみ採用
   const submittedUserIds = uniq(submitters).filter((u) => targetsSet.has(u));
   const submittedSet = new Set(submittedUserIds);
 
@@ -269,7 +299,7 @@ async function runCheck({ label, reportChannelId, cutoffTime, notifyChannelId })
   await postAdminSummaryThreaded({
     channelId: notifyChannelId || reportChannelId,
     label,
-    now,
+    reportDate,
     targetsCount: targetUserIds.length,
     missingUserIds,
     idToNameMap,
@@ -280,15 +310,16 @@ async function runCheck({ label, reportChannelId, cutoffTime, notifyChannelId })
  * Scheduling
  */
 function scheduleJobs() {
-  // 退勤: 毎日 CUTOFF_TIME_OUT (JST)
+  // 退勤：翌朝 RUN_TIME_OUT に「前日分」をチェックして退勤チャンネルへ通知
   cron.schedule(
-    `${parseInt(CUTOFF_TIME_OUT.split(":")[1], 10)} ${parseInt(CUTOFF_TIME_OUT.split(":")[0], 10)} * * *`,
+    `${parseInt(RUN_TIME_OUT.split(":")[1], 10)} ${parseInt(RUN_TIME_OUT.split(":")[0], 10)} * * *`,
     async () => {
       try {
         await runCheck({
           label: "退勤",
           reportChannelId: REPORT_CHANNEL_OUT,
-          cutoffTime: CUTOFF_TIME_OUT,
+          cutoffTime: CUTOFF_TIME_OUT, // 前日 00:00〜23:59:59
+          dayOffset: -1,
         });
       } catch (e) {
         console.error("[退勤] job error", e);
@@ -297,16 +328,17 @@ function scheduleJobs() {
     { timezone: TZ }
   );
 
-  // 出勤（設定されている場合のみ）
+  // 出勤：RUN_TIME_IN に「当日分」をチェックして出勤チャンネルへ通知
   if (REPORT_CHANNEL_IN) {
     cron.schedule(
-      `${parseInt(CUTOFF_TIME_IN.split(":")[1], 10)} ${parseInt(CUTOFF_TIME_IN.split(":")[0], 10)} * * *`,
+      `${parseInt(RUN_TIME_IN.split(":")[1], 10)} ${parseInt(RUN_TIME_IN.split(":")[0], 10)} * * *`,
       async () => {
         try {
           await runCheck({
             label: "出勤",
             reportChannelId: REPORT_CHANNEL_IN,
-            cutoffTime: CUTOFF_TIME_IN,
+            cutoffTime: CUTOFF_TIME_IN, // 当日 00:00〜(cutoff-1秒)
+            dayOffset: 0,
           });
         } catch (e) {
           console.error("[出勤] job error", e);
@@ -318,7 +350,9 @@ function scheduleJobs() {
 
   console.log("cron scheduled", {
     TZ,
+    RUN_TIME_OUT,
     CUTOFF_TIME_OUT,
+    RUN_TIME_IN,
     CUTOFF_TIME_IN,
     hasIn: !!REPORT_CHANNEL_IN,
   });
@@ -328,22 +362,31 @@ function scheduleJobs() {
  * Main
  */
 (async () => {
-  console.log("daily-report-watcher boot", { TZ, RUN_ON_BOOT, hasTestChannel: !!TEST_NOTIFY_CHANNEL });
+  console.log("daily-report-watcher boot", {
+    TZ,
+    RUN_ON_BOOT,
+    hasTestChannel: !!TEST_NOTIFY_CHANNEL,
+    excludeUserIds: EXCLUDE_USER_IDS,
+  });
 
   scheduleJobs();
 
-  // 起動テストはテスト用チャンネルが設定されている場合のみ実行（事故防止）
+  // 起動テスト：TEST_NOTIFY_CHANNEL がある場合のみ実行（事故防止）
   if (RUN_ON_BOOT) {
     if (!TEST_NOTIFY_CHANNEL) {
-      console.warn("RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels.");
+      console.warn(
+        "RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels."
+      );
       return;
     }
 
     try {
+      // 起動テストは「退勤（前日）」をテストチャンネルへ
       await runCheck({
         label: "退勤(起動テスト)",
         reportChannelId: REPORT_CHANNEL_OUT,
         cutoffTime: CUTOFF_TIME_OUT,
+        dayOffset: -1,
         notifyChannelId: TEST_NOTIFY_CHANNEL,
       });
     } catch (e) {
