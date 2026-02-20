@@ -3,6 +3,7 @@ import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
 import timezone from "dayjs/plugin/timezone.js";
 import { WebClient } from "@slack/web-api";
+import jpholiday from "japanese-holidays";
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -14,7 +15,7 @@ const TZ = process.env.TIMEZONE || "Asia/Tokyo";
 const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 
 const USERGROUP_ID = process.env.USERGROUP_ID; // 提出対象者（社員など）
-const ADMIN_USERGROUP_ID = process.env.ADMIN_USERGROUP_ID || ""; // 日報管理者ユーザーグループID: S...
+const ADMIN_USERGROUP_ID = process.env.ADMIN_USERGROUP_ID || ""; // 人事などのユーザーグループID: S...
 
 // 除外ユーザー（例：システム管理者など）をユーザーIDで指定（カンマ区切り）
 const EXCLUDE_USER_IDS = (process.env.EXCLUDE_USER_IDS || "")
@@ -25,13 +26,13 @@ const EXCLUDE_SET = new Set(EXCLUDE_USER_IDS);
 
 // 退勤
 const REPORT_CHANNEL_OUT = process.env.REPORT_CHANNEL_OUT; // #all-退勤日報 の channel id
-const CUTOFF_TIME_OUT = process.env.CUTOFF_TIME_OUT || "23:59"; // 判定レンジの締め（A案：23:59）
+const CUTOFF_TIME_OUT = process.env.CUTOFF_TIME_OUT || "23:59"; // 判定レンジの締め（当日中判定）
 const RUN_TIME_OUT = process.env.RUN_TIME_OUT || "08:00"; // ★通知を出す時刻（翌朝）
 
 // 出勤（任意）
 const REPORT_CHANNEL_IN = process.env.REPORT_CHANNEL_IN || ""; // #all-出勤日報 の channel id
-const CUTOFF_TIME_IN = process.env.CUTOFF_TIME_IN || "12:00"; // 判定レンジの締め（例：12:00）
-const RUN_TIME_IN = process.env.RUN_TIME_IN || CUTOFF_TIME_IN; // 通知を出す時刻（基本は締め時刻に合わせる）
+const CUTOFF_TIME_IN = process.env.CUTOFF_TIME_IN || "12:00"; // 判定レンジの締め
+const RUN_TIME_IN = process.env.RUN_TIME_IN || CUTOFF_TIME_IN; // 通知を出す時刻
 
 // 起動テスト
 const RUN_ON_BOOT = (process.env.RUN_ON_BOOT || "").toLowerCase() === "true";
@@ -96,6 +97,13 @@ function uniq(array) {
 
 function adminMentionText() {
   return ADMIN_USERGROUP_ID ? `<!subteam^${ADMIN_USERGROUP_ID}>` : "";
+}
+
+// ★ 追加：土日 or 日本の祝日なら true
+function isHolidayOrWeekendJp(dayTz) {
+  const dow = dayTz.day(); // 0=Sun, 6=Sat
+  if (dow === 0 || dow === 6) return true; // 土日
+  return Boolean(jpholiday.isHoliday(dayTz.toDate())); // 祝日
 }
 
 /**
@@ -172,21 +180,19 @@ function mapUserIdsToNames(userIds, idToNameMap) {
 
 /**
  * 通知（チャンネルに投稿）
- * - 親：管理者メンション + 対象/未提出（検出は出さない）
+ * - 親：@人事 + 文面 + 日付/未提出
  * - スレッド：未提出者の「名前だけ」一覧（メンション無し）
  */
 async function postAdminSummaryThreaded({
   channelId,
   label,
   reportDate,
-  targetsCount,     // ← 使わないなら呼び出し側から渡さなくてもOK
   missingUserIds,
   idToNameMap,
 }) {
-  const adminMention = adminMentionText(); // <!subteam^S...> になる（= @人事）
+  const adminMention = adminMentionText();
   const missingCount = missingUserIds.length;
 
-  // ★ここがリクエスト文面
   const parentText = `${adminMention}
 お疲れ様です。
 本日の${label}日報の未提出者をお知らせいたします。
@@ -201,7 +207,6 @@ async function postAdminSummaryThreaded({
     text: parentText,
   });
 
-  // スレッド：未提出者一覧（メンションしない “名前だけ”）
   if (missingCount === 0) {
     await client.chat.postMessage({
       channel: channelId,
@@ -211,6 +216,7 @@ async function postAdminSummaryThreaded({
     return;
   }
 
+  // スレッドに「名前だけ」を分割投稿
   const chunkSize = 40;
   for (let i = 0; i < missingUserIds.length; i += chunkSize) {
     const chunk = missingUserIds.slice(i, i + chunkSize);
@@ -235,10 +241,6 @@ async function postAdminSummaryThreaded({
  * dayOffset:
  *  - 出勤：0（当日）
  *  - 退勤：-1（前日）
- *
- * notifyChannelId:
- *  - 未指定なら reportChannelId（＝出勤は出勤チャンネル、退勤は退勤チャンネル）
- *  - 起動テスト時だけ TEST_NOTIFY_CHANNEL に差し替える用途
  */
 async function runCheck({
   label,
@@ -251,6 +253,13 @@ async function runCheck({
     cutoffTimeHHmm: cutoffTime,
     dayOffset,
   });
+
+  // ★追加：休日（祝日＋土日）はスキップ
+  const reportDay = dayjs.tz(reportDate, TZ);
+  if (isHolidayOrWeekendJp(reportDay)) {
+    console.log(`[${label}] skip holiday/weekend`, { reportDate });
+    return;
+  }
 
   console.log(`[${label}] start check`, {
     reportChannelId,
@@ -301,7 +310,6 @@ async function runCheck({
     channelId: notifyChannelId || reportChannelId,
     label,
     reportDate,
-    targetsCount: targetUserIds.length,
     missingUserIds,
     idToNameMap,
   });
@@ -372,38 +380,37 @@ function scheduleJobs() {
 
   scheduleJobs();
 
-if (RUN_ON_BOOT) {
-  if (!TEST_NOTIFY_CHANNEL) {
-    console.warn(
-      "RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels."
-    );
-    return;
-  }
+  // 起動テスト：TEST_NOTIFY_CHANNEL がある場合のみ実行（事故防止）
+  if (RUN_ON_BOOT) {
+    if (!TEST_NOTIFY_CHANNEL) {
+      console.warn(
+        "RUN_ON_BOOT=true but TEST_NOTIFY_CHANNEL is not set. Skip boot test to avoid notifying production channels."
+      );
+      return;
+    }
 
-  try {
-    // 退勤：前日分（00:00〜23:59:59）をテストチャンネルへ
-    await runCheck({
-      label: "退勤(起動テスト)",
-      reportChannelId: REPORT_CHANNEL_OUT,
-      cutoffTime: CUTOFF_TIME_OUT,
-      dayOffset: -1,
-      notifyChannelId: TEST_NOTIFY_CHANNEL,
-    });
-
-    // 出勤：当日分（00:00〜(cutoff-1秒)）をテストチャンネルへ
-    if (REPORT_CHANNEL_IN) {
+    try {
+      // 起動テストは「退勤（前日）」をテストチャンネルへ
       await runCheck({
-        label: "出勤(起動テスト)",
-        reportChannelId: REPORT_CHANNEL_IN,
-        cutoffTime: CUTOFF_TIME_IN,
-        dayOffset: 0,
+        label: "退勤(起動テスト)",
+        reportChannelId: REPORT_CHANNEL_OUT,
+        cutoffTime: CUTOFF_TIME_OUT,
+        dayOffset: -1,
         notifyChannelId: TEST_NOTIFY_CHANNEL,
       });
-    } else {
-      console.warn("REPORT_CHANNEL_IN is not set. Skip IN boot test.");
+
+      // 出勤もテスト
+      if (REPORT_CHANNEL_IN) {
+        await runCheck({
+          label: "出勤(起動テスト)",
+          reportChannelId: REPORT_CHANNEL_IN,
+          cutoffTime: CUTOFF_TIME_IN,
+          dayOffset: 0,
+          notifyChannelId: TEST_NOTIFY_CHANNEL,
+        });
+      }
+    } catch (e) {
+      console.error("[起動テスト] error", e);
     }
-  } catch (e) {
-    console.error("[起動テスト] error", e);
   }
-}
 })();
