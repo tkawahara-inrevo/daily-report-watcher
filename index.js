@@ -255,11 +255,18 @@ async function runCheck({
   });
 
   // ★追加：休日（祝日＋土日）はスキップ
-  const reportDay = dayjs.tz(reportDate, TZ);
-  if (isHolidayOrWeekendJp(reportDay)) {
-    console.log(`[${label}] skip holiday/weekend`, { reportDate });
-    return;
-  }
+  function isHolidayOrWeekendJp(dayTz) {
+  const dow = dayTz.day(); // 0=Sun, 6=Sat
+  if (dow === 0 || dow === 6) return true; // 土日
+
+  // ★重要：JSTで見た年月日を「数値」として取り出してDateを作る（toDate()は使わない）
+  const y = dayTz.year();
+  const m = dayTz.month(); // 0-based
+  const d = dayTz.date();
+  const localDate = new Date(y, m, d); // サーバTZでも「同じ年月日」になる
+
+  return Boolean(jpholiday.isHoliday(localDate)); // 祝日
+}
 
   console.log(`[${label}] start check`, {
     reportChannelId,
