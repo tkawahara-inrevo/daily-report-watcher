@@ -99,11 +99,17 @@ function adminMentionText() {
   return ADMIN_USERGROUP_ID ? `<!subteam^${ADMIN_USERGROUP_ID}>` : "";
 }
 
-// ★ 追加：土日 or 日本の祝日なら true
 function isHolidayOrWeekendJp(dayTz) {
   const dow = dayTz.day(); // 0=Sun, 6=Sat
   if (dow === 0 || dow === 6) return true; // 土日
-  return Boolean(jpholiday.isHoliday(dayTz.toDate())); // 祝日
+
+  // ★重要：JSTで見た「年月日」を固定して Date を作る（toDate()は使わない）
+  const y = dayTz.year();
+  const m = dayTz.month(); // 0-based
+  const d = dayTz.date();
+  const dateForHolidayLib = new Date(y, m, d);
+
+  return Boolean(jpholiday.isHoliday(dateForHolidayLib));
 }
 
 /**
@@ -254,19 +260,12 @@ async function runCheck({
     dayOffset,
   });
 
-  // ★追加：休日（祝日＋土日）はスキップ
-  function isHolidayOrWeekendJp(dayTz) {
-  const dow = dayTz.day(); // 0=Sun, 6=Sat
-  if (dow === 0 || dow === 6) return true; // 土日
-
-  // ★重要：JSTで見た年月日を「数値」として取り出してDateを作る（toDate()は使わない）
-  const y = dayTz.year();
-  const m = dayTz.month(); // 0-based
-  const d = dayTz.date();
-  const localDate = new Date(y, m, d); // サーバTZでも「同じ年月日」になる
-
-  return Boolean(jpholiday.isHoliday(localDate)); // 祝日
-}
+  // ★休日（祝日＋土日）はスキップ（出勤=当日 / 退勤=前日 がそのまま効く）
+  const reportDay = dayjs.tz(reportDate, TZ);
+  if (isHolidayOrWeekendJp(reportDay)) {
+    console.log(`[${label}] skip holiday/weekend`, { reportDate });
+    return;
+  }
 
   console.log(`[${label}] start check`, {
     reportChannelId,
@@ -321,7 +320,6 @@ async function runCheck({
     idToNameMap,
   });
 }
-
 /**
  * Scheduling
  */
