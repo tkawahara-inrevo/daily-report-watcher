@@ -397,7 +397,8 @@ function scheduleJobs() {
     TZ,
     RUN_ON_BOOT,
     hasTestChannel: !!TEST_NOTIFY_CHANNEL,
-    excludeUserIds: EXCLUDE_USER_IDS,
+    excludeSource: TASK_HUB_URL ? "TaskHub API" : "env",
+    excludeFallbackCount: EXCLUDE_USER_IDS_FALLBACK.length,
   });
 
   scheduleJobs();
