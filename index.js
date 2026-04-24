@@ -17,12 +17,28 @@ const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const USERGROUP_ID = process.env.USERGROUP_ID; // 提出対象者（社員など）
 const ADMIN_USERGROUP_ID = process.env.ADMIN_USERGROUP_ID || ""; // 人事などのユーザーグループID: S...
 
-// 除外ユーザー（例：システム管理者など）をユーザーIDで指定（カンマ区切り）
-const EXCLUDE_USER_IDS = (process.env.EXCLUDE_USER_IDS || "")
+// 除外ユーザー管理
+// TASK_HUB_URL が設定されている場合はAPIから動的取得。未設定時は EXCLUDE_USER_IDS にフォールバック。
+const TASK_HUB_URL = (process.env.TASK_HUB_URL || "").replace(/\/+$/, "");
+const EXCLUDE_USER_IDS_FALLBACK = (process.env.EXCLUDE_USER_IDS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const EXCLUDE_SET = new Set(EXCLUDE_USER_IDS);
+
+async function fetchExcludeSet() {
+  if (TASK_HUB_URL) {
+    try {
+      const res = await fetch(`${TASK_HUB_URL}/api/admin/daily-report/excludes`);
+      const data = await res.json();
+      const ids = data.excludes || [];
+      console.log(`[exclude] fetched ${ids.length} excluded users from TaskHub`);
+      return new Set(ids);
+    } catch (e) {
+      console.warn(`[exclude] failed to fetch from TaskHub, falling back to env: ${e.message}`);
+    }
+  }
+  return new Set(EXCLUDE_USER_IDS_FALLBACK);
+}
 
 // 退勤
 const REPORT_CHANNEL_OUT = process.env.REPORT_CHANNEL_OUT; // #all-退勤日報 の channel id
@@ -276,12 +292,13 @@ async function runCheck({
     now: now.format(),
     reportDate,
     notifyChannelId: notifyChannelId || reportChannelId,
-    excludeCount: EXCLUDE_USER_IDS.length,
+    excludeSource: TASK_HUB_URL ? "TaskHub API" : "env",
   });
 
   // 1) 対象者（ユーザーグループ）取得 → 除外を引く
   const rawTargetUserIds = await getUserIdsFromUsergroup(USERGROUP_ID);
-  const targetUserIds = rawTargetUserIds.filter((u) => !EXCLUDE_SET.has(u));
+  const excludeSet = await fetchExcludeSet();
+  const targetUserIds = rawTargetUserIds.filter((u) => !excludeSet.has(u));
   const targetsSet = new Set(targetUserIds);
 
   // 2) チャンネル履歴（レンジ内）
